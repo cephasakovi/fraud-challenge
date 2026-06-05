@@ -81,6 +81,26 @@ SCORE_BURST = 0.8
 SCORE_DUPLICATE = 0.8
 
 
+def _to_amount(value):
+    """Convertit un montant en float de façon tolérante (str, virgule…), sinon None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip().replace(" ", "").replace(",", ".")
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
+
+
+def _is_blank(value):
+    """True si la valeur est absente ou vide (None ou chaîne d'espaces)."""
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+
 def _parse_timestamp(ts):
     """Convertit un horodatage ISO 8601 en datetime aware (UTC), ou None."""
     if not ts:
@@ -182,22 +202,17 @@ def _duplicate_flagged_ids(transactions):
     for user_txs in _group_by_user(transactions).values():
         located = []
         for t in user_txs:
-            amount = t.get("amount")
+            amount = _to_amount(t.get("amount"))
             dt = _parse_timestamp(t.get("timestamp"))
-            if (
-                t.get("merchant")
-                and isinstance(amount, (int, float))
-                and amount > 0
-                and dt is not None
-            ):
-                located.append((t, dt))
-        for (ta, da) in located:
-            for (tb, db) in located:
+            if t.get("merchant") and amount is not None and amount > 0 and dt is not None:
+                located.append((t, amount, dt))
+        for (ta, aa, da) in located:
+            for (tb, ab, db) in located:
                 if ta is tb:
                     continue
                 if (
                     ta.get("merchant") == tb.get("merchant")
-                    and ta.get("amount") == tb.get("amount")
+                    and aa == ab
                     and abs((db - da).total_seconds()) <= window
                 ):
                     flagged.add(id(ta))
@@ -209,9 +224,9 @@ def _user_amounts(transactions):
     """Pour chaque utilisateur, la liste de ses montants valides (> 0)."""
     amounts = {}
     for tx in transactions:
-        amount = tx.get("amount")
-        if isinstance(amount, (int, float)) and amount > 0:
-            amounts.setdefault(tx.get("user_id"), []).append(float(amount))
+        amount = _to_amount(tx.get("amount"))
+        if amount is not None and amount > 0:
+            amounts.setdefault(tx.get("user_id"), []).append(amount)
     return amounts
 
 
@@ -240,24 +255,30 @@ def detect_fraud(transactions):
     for tx in transactions:
         reasons = []  # liste de (score, raison)
 
-        amount = tx.get("amount")
+        amount = _to_amount(tx.get("amount"))
 
         # --- Niveau 1 : champs obligatoires manquants ---
-        missing = [f for f in REQUIRED_FIELDS if tx.get(f) in (None, "")]
+        missing = []
+        for field in REQUIRED_FIELDS:
+            if field == "amount":
+                if amount is None:
+                    missing.append("amount")
+            elif _is_blank(tx.get(field)):
+                missing.append(field)
         if missing:
             reasons.append(
                 (SCORE_MISSING, "Champs obligatoires manquants: " + ", ".join(missing))
             )
 
         # --- Niveau 1 : montant nul ou négatif ---
-        if isinstance(amount, (int, float)) and amount <= 0:
+        if amount is not None and amount <= 0:
             reasons.append((SCORE_NEGATIVE, "Montant nul ou négatif"))
 
         # --- Niveau 2 : montant très supérieur à l'habitude du client ---
         # On compare au montant *habituel* via la médiane des autres
         # transactions du client : robuste face à une valeur aberrante isolée
         # dans l'historique (la moyenne, elle, se laisse tirer par un outlier).
-        if isinstance(amount, (int, float)) and amount > 0:
+        if amount is not None and amount > 0:
             others = list(user_amounts.get(tx.get("user_id"), []))
             if amount in others:
                 others.remove(amount)
