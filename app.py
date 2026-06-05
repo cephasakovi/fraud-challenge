@@ -88,9 +88,20 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
         )
         cg, ct = st.columns([1, 1])
         with cg:
+            st.caption("Répartition par motif")
             st.bar_chart(motifs.set_index("Motif"))
         with ct:
-            st.dataframe(motifs, use_container_width=True, hide_index=True)
+            pays = (
+                df.loc[df["Suspecte"] & df["Pays"].notna(), "Pays"]
+                .value_counts()
+                .rename_axis("Pays")
+                .reset_index(name="Alertes")
+            )
+            if not pays.empty:
+                st.caption("Alertes par pays")
+                st.bar_chart(pays.set_index("Pays"))
+            else:
+                st.dataframe(motifs, use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -133,6 +144,16 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
                     min_value=0, max_value=100, format="%d%%",
                 ),
             },
+        )
+
+    # --- Export des alertes pour l'équipe conformité ---
+    suspects = df[df["Suspecte"]]
+    if not suspects.empty:
+        st.download_button(
+            "⬇️ Exporter les alertes (CSV)",
+            data=suspects.to_csv(index=False).encode("utf-8-sig"),
+            file_name="alertes_fraude.csv",
+            mime="text/csv",
         )
 
     # --- Zone pédagogique : comment l'outil décide ---
