@@ -70,7 +70,9 @@ IMPOSSIBLE_TRAVEL_HOURS = 6
 BURST_RULES = ((1, 3), (10, 4))
 
 # Doublon / rejeu : même montant et même commerçant à très peu d'intervalle.
-DUPLICATE_WINDOW_MINUTES = 5
+# Fenêtre volontairement courte : un vrai double débit survient en quelques
+# secondes, alors que deux petits achats légitimes peuvent être plus espacés.
+DUPLICATE_WINDOW_MINUTES = 2
 
 # Seuils de score par règle (alignés sur la référence du défi).
 SCORE_NEGATIVE = 0.9
