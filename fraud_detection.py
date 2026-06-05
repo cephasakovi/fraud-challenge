@@ -150,15 +150,24 @@ def _burst_flagged_ids(transactions):
     return flagged
 
 
-def _user_amount_stats(transactions):
-    """Pour chaque utilisateur, la somme et le nombre de montants valides (> 0)."""
-    stats = {}
+def _median(values):
+    """Médiane d'une liste de nombres (liste supposée non vide)."""
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+def _user_amounts(transactions):
+    """Pour chaque utilisateur, la liste de ses montants valides (> 0)."""
+    amounts = {}
     for tx in transactions:
         amount = tx.get("amount")
         if isinstance(amount, (int, float)) and amount > 0:
-            total, n = stats.get(tx.get("user_id"), (0.0, 0))
-            stats[tx.get("user_id")] = (total + amount, n + 1)
-    return stats
+            amounts.setdefault(tx.get("user_id"), []).append(float(amount))
+    return amounts
 
 
 def detect_fraud(transactions):
@@ -179,7 +188,7 @@ def detect_fraud(transactions):
 
     geo_flagged = _geo_flagged_ids(transactions)
     burst_flagged = _burst_flagged_ids(transactions)
-    amount_stats = _user_amount_stats(transactions)
+    user_amounts = _user_amounts(transactions)
 
     results = []
     for tx in transactions:
@@ -199,12 +208,15 @@ def detect_fraud(transactions):
             reasons.append((SCORE_NEGATIVE, "Montant nul ou négatif"))
 
         # --- Niveau 2 : montant très supérieur à l'habitude du client ---
+        # On compare au montant *habituel* via la médiane des autres
+        # transactions du client : robuste face à une valeur aberrante isolée
+        # dans l'historique (la moyenne, elle, se laisse tirer par un outlier).
         if isinstance(amount, (int, float)) and amount > 0:
-            total, n = amount_stats.get(tx.get("user_id"), (0.0, 0))
-            others_total = total - amount
-            others_n = n - 1
-            if others_n >= MIN_HISTORY_FOR_AMOUNT:
-                typical = others_total / others_n
+            others = list(user_amounts.get(tx.get("user_id"), []))
+            if amount in others:
+                others.remove(amount)
+            if len(others) >= MIN_HISTORY_FOR_AMOUNT:
+                typical = _median(others)
                 if typical > 0 and (
                     amount > HIGH_AMOUNT_FACTOR * typical
                     and amount - typical > HIGH_AMOUNT_ABS_MARGIN
