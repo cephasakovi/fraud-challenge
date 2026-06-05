@@ -6,6 +6,7 @@ La fonction `load_transactions` vous est FOURNIE (ne la modifiez pas).
 """
 
 import csv
+from collections import Counter
 from datetime import datetime, timezone
 
 
@@ -139,11 +140,13 @@ def _group_by_user(transactions):
 def _geo_flagged_ids(transactions):
     """Identifiants impliqués dans un changement de pays trop rapide pour être réel.
 
-    On compare toutes les paires de transactions d'un même client (et pas
-    seulement les consécutives) : ainsi une opération intercalée dans le même
-    pays ne masque pas un aller-retour géographique impossible.
+    Une transaction est signalée s'il existe, à moins de
+    ``IMPOSSIBLE_TRAVEL_HOURS`` d'écart, une autre opération du même client dans
+    un pays différent. Implémentation par tri + fenêtre glissante (O(n log n)) :
+    on maintient le décompte des pays présents dans la fenêtre temporelle.
     """
     flagged = set()
+    window = IMPOSSIBLE_TRAVEL_HOURS * 3600.0
     for user_txs in _group_by_user(transactions).values():
         located = [
             (t, _parse_timestamp(t.get("timestamp")))
@@ -151,18 +154,33 @@ def _geo_flagged_ids(transactions):
             if t.get("country")
         ]
         located = [(t, dt) for (t, dt) in located if dt is not None]
-        for i, (ta, da) in enumerate(located):
-            for (tb, db) in located[i + 1:]:
-                if ta.get("country") != tb.get("country"):
-                    gap_hours = abs((db - da).total_seconds()) / 3600.0
-                    if gap_hours < IMPOSSIBLE_TRAVEL_HOURS:
-                        flagged.add(id(ta))
-                        flagged.add(id(tb))
+        located.sort(key=lambda p: p[1])
+        ts = [dt.timestamp() for (_, dt) in located]
+        countries = [t.get("country") for (t, _) in located]
+        n = len(located)
+        counts = Counter()
+        left = right = 0
+        for i in range(n):
+            while right < n and ts[right] - ts[i] < window:
+                counts[countries[right]] += 1
+                right += 1
+            while ts[i] - ts[left] >= window:
+                counts[countries[left]] -= 1
+                if counts[countries[left]] == 0:
+                    del counts[countries[left]]
+                left += 1
+            # Voisins dans la fenêtre ayant un pays différent du nôtre :
+            if (right - left) - counts.get(countries[i], 0) > 0:
+                flagged.add(id(located[i][0]))
     return flagged
 
 
 def _burst_flagged_ids(transactions):
-    """Identifiants pris dans une rafale anormale d'opérations (ex. test de carte)."""
+    """Identifiants pris dans une rafale anormale d'opérations (ex. test de carte).
+
+    Pour chaque règle (fenêtre, seuil), comptage par fenêtre glissante sur les
+    horodatages triés (O(n log n)).
+    """
     flagged = set()
     for user_txs in _group_by_user(transactions).values():
         located = [
@@ -170,16 +188,21 @@ def _burst_flagged_ids(transactions):
             for t in user_txs
         ]
         located = [(t, dt) for (t, dt) in located if dt is not None]
-        for (ti, di) in located:
-            for minutes, min_count in BURST_RULES:
-                window = minutes * 60.0
-                count = sum(
-                    1 for (_, dj) in located
-                    if abs((dj - di).total_seconds()) <= window
-                )
-                if count >= min_count:
-                    flagged.add(id(ti))
-                    break
+        located.sort(key=lambda p: p[1])
+        ts = [dt.timestamp() for (_, dt) in located]
+        n = len(located)
+        for minutes, min_count in BURST_RULES:
+            window = minutes * 60.0
+            left = right = 0
+            for i in range(n):
+                if right < i:
+                    right = i
+                while right < n and ts[right] - ts[i] <= window:
+                    right += 1
+                while ts[i] - ts[left] > window:
+                    left += 1
+                if (right - left) >= min_count:
+                    flagged.add(id(located[i][0]))
     return flagged
 
 
@@ -198,27 +221,29 @@ def _duplicate_flagged_ids(transactions):
 
     Même client, même commerçant et même montant (> 0) à moins de quelques
     minutes d'intervalle : signature classique d'un double débit ou d'un rejeu.
+
+    On regroupe par (client, commerçant, montant) puis, sur les horodatages
+    triés, il suffit de comparer chaque opération à sa voisine immédiate
+    (O(n log n)).
     """
     flagged = set()
     window = DUPLICATE_WINDOW_MINUTES * 60.0
-    for user_txs in _group_by_user(transactions).values():
-        located = []
-        for t in user_txs:
-            amount = _to_amount(t.get("amount"))
-            dt = _parse_timestamp(t.get("timestamp"))
-            if t.get("merchant") and amount is not None and amount > 0 and dt is not None:
-                located.append((t, amount, dt))
-        for (ta, aa, da) in located:
-            for (tb, ab, db) in located:
-                if ta is tb:
-                    continue
-                if (
-                    ta.get("merchant") == tb.get("merchant")
-                    and aa == ab
-                    and abs((db - da).total_seconds()) <= window
-                ):
-                    flagged.add(id(ta))
-                    flagged.add(id(tb))
+    groups = {}
+    for t in transactions:
+        amount = _to_amount(t.get("amount"))
+        dt = _parse_timestamp(t.get("timestamp"))
+        if t.get("merchant") and amount is not None and amount > 0 and dt is not None:
+            key = (t.get("user_id"), t.get("merchant"), amount)
+            groups.setdefault(key, []).append((t, dt.timestamp()))
+    for items in groups.values():
+        items.sort(key=lambda p: p[1])
+        ts = [s for (_, s) in items]
+        n = len(items)
+        for i in range(n):
+            near_before = i > 0 and ts[i] - ts[i - 1] <= window
+            near_after = i + 1 < n and ts[i + 1] - ts[i] <= window
+            if near_before or near_after:
+                flagged.add(id(items[i][0]))
     return flagged
 
 
@@ -252,6 +277,8 @@ def detect_fraud(transactions):
     burst_flagged = _burst_flagged_ids(transactions)
     duplicate_flagged = _duplicate_flagged_ids(transactions)
     user_amounts = _user_amounts(transactions)
+    # Médiane des dépenses par client, calculée une seule fois (O(n log n)).
+    user_median = {u: _median(v) for u, v in user_amounts.items()}
 
     results = []
     for tx in transactions:
@@ -277,15 +304,13 @@ def detect_fraud(transactions):
             reasons.append((SCORE_NEGATIVE, "Montant nul ou négatif"))
 
         # --- Niveau 2 : montant très supérieur à l'habitude du client ---
-        # On compare au montant *habituel* via la médiane des autres
-        # transactions du client : robuste face à une valeur aberrante isolée
-        # dans l'historique (la moyenne, elle, se laisse tirer par un outlier).
+        # On compare au montant *habituel* via la médiane des dépenses du
+        # client (robuste face à une valeur aberrante isolée, contrairement à
+        # la moyenne). La médiane est pré-calculée une fois par client.
         if amount is not None and amount > 0:
-            others = list(user_amounts.get(tx.get("user_id"), []))
-            if amount in others:
-                others.remove(amount)
-            if len(others) >= MIN_HISTORY_FOR_AMOUNT:
-                typical = _median(others)
+            vals = user_amounts.get(tx.get("user_id"))
+            if vals is not None and len(vals) > MIN_HISTORY_FOR_AMOUNT:
+                typical = user_median[tx.get("user_id")]
                 if typical > 0 and (
                     amount > HIGH_AMOUNT_FACTOR * typical
                     and amount - typical > HIGH_AMOUNT_ABS_MARGIN
