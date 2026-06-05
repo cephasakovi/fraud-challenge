@@ -64,9 +64,10 @@ MIN_HISTORY_FOR_AMOUNT = 2
 # Deux pays différents séparés par moins de ce délai = déplacement impossible.
 IMPOSSIBLE_TRAVEL_HOURS = 6
 
-# Rafale de transactions : trop d'opérations dans une fenêtre très courte.
-BURST_WINDOW_MINUTES = 10
-BURST_MIN_COUNT = 4
+# Rafale de transactions : trop d'opérations dans une fenêtre courte.
+# Plusieurs fenêtres pour couvrir aussi bien les rafales très rapides
+# (test de carte) que les pics plus étalés. (minutes, nombre minimal)
+BURST_RULES = ((1, 3), (10, 4))
 
 # Doublon / rejeu : même montant et même commerçant à très peu d'intervalle.
 DUPLICATE_WINDOW_MINUTES = 5
@@ -147,15 +148,16 @@ def _burst_flagged_ids(transactions):
             for t in user_txs
         ]
         located = [(t, dt) for (t, dt) in located if dt is not None]
-        located.sort(key=lambda pair: pair[1])
-        window = BURST_WINDOW_MINUTES * 60.0
-        for i, (ti, di) in enumerate(located):
-            count = sum(
-                1 for (_, dj) in located
-                if abs((dj - di).total_seconds()) <= window
-            )
-            if count >= BURST_MIN_COUNT:
-                flagged.add(id(ti))
+        for (ti, di) in located:
+            for minutes, min_count in BURST_RULES:
+                window = minutes * 60.0
+                count = sum(
+                    1 for (_, dj) in located
+                    if abs((dj - di).total_seconds()) <= window
+                )
+                if count >= min_count:
+                    flagged.add(id(ti))
+                    break
     return flagged
 
 
