@@ -103,6 +103,18 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
             else:
                 st.dataframe(motifs, use_container_width=True, hide_index=True)
 
+        top_clients = (
+            df.loc[df["Suspecte"] & df["Client"].notna()]
+            .groupby("Client")
+            .agg(Alertes=("Suspecte", "sum"), Risque_max=("Risque", "max"))
+            .sort_values(["Alertes", "Risque_max"], ascending=False)
+            .head(5)
+            .reset_index()
+        )
+        if not top_clients.empty:
+            st.caption("Clients les plus à risque")
+            st.dataframe(top_clients, use_container_width=True, hide_index=True)
+
     st.divider()
 
     # --- Tableau filtrable ---
