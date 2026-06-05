@@ -68,12 +68,16 @@ IMPOSSIBLE_TRAVEL_HOURS = 6
 BURST_WINDOW_MINUTES = 10
 BURST_MIN_COUNT = 4
 
+# Doublon / rejeu : même montant et même commerçant à très peu d'intervalle.
+DUPLICATE_WINDOW_MINUTES = 5
+
 # Seuils de score par règle (alignés sur la référence du défi).
 SCORE_NEGATIVE = 0.9
 SCORE_HIGH_AMOUNT = 0.9
 SCORE_GEO = 0.88
 SCORE_MISSING = 0.85
 SCORE_BURST = 0.8
+SCORE_DUPLICATE = 0.8
 
 
 def _parse_timestamp(ts):
@@ -160,6 +164,40 @@ def _median(values):
     return (s[mid - 1] + s[mid]) / 2.0
 
 
+def _duplicate_flagged_ids(transactions):
+    """Identifiants de transactions qui se répètent à l'identique trop vite.
+
+    Même client, même commerçant et même montant (> 0) à moins de quelques
+    minutes d'intervalle : signature classique d'un double débit ou d'un rejeu.
+    """
+    flagged = set()
+    window = DUPLICATE_WINDOW_MINUTES * 60.0
+    for user_txs in _group_by_user(transactions).values():
+        located = []
+        for t in user_txs:
+            amount = t.get("amount")
+            dt = _parse_timestamp(t.get("timestamp"))
+            if (
+                t.get("merchant")
+                and isinstance(amount, (int, float))
+                and amount > 0
+                and dt is not None
+            ):
+                located.append((t, dt))
+        for (ta, da) in located:
+            for (tb, db) in located:
+                if ta is tb:
+                    continue
+                if (
+                    ta.get("merchant") == tb.get("merchant")
+                    and ta.get("amount") == tb.get("amount")
+                    and abs((db - da).total_seconds()) <= window
+                ):
+                    flagged.add(id(ta))
+                    flagged.add(id(tb))
+    return flagged
+
+
 def _user_amounts(transactions):
     """Pour chaque utilisateur, la liste de ses montants valides (> 0)."""
     amounts = {}
@@ -188,6 +226,7 @@ def detect_fraud(transactions):
 
     geo_flagged = _geo_flagged_ids(transactions)
     burst_flagged = _burst_flagged_ids(transactions)
+    duplicate_flagged = _duplicate_flagged_ids(transactions)
     user_amounts = _user_amounts(transactions)
 
     results = []
@@ -235,6 +274,13 @@ def detect_fraud(transactions):
         # --- Niveau 2 : fréquence / rafale anormale ---
         if id(tx) in burst_flagged:
             reasons.append((SCORE_BURST, "Fréquence de transactions anormale"))
+
+        # --- Niveau 3 : doublon / rejeu de transaction ---
+        if id(tx) in duplicate_flagged:
+            reasons.append(
+                (SCORE_DUPLICATE,
+                 "Transaction en double suspecte (même montant et commerçant)")
+            )
 
         # --- Verdict : on retient la raison la plus grave ---
         if reasons:
