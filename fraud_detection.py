@@ -114,7 +114,12 @@ def _group_by_user(transactions):
 
 
 def _geo_flagged_ids(transactions):
-    """Identifiants impliqués dans un changement de pays trop rapide pour être réel."""
+    """Identifiants impliqués dans un changement de pays trop rapide pour être réel.
+
+    On compare toutes les paires de transactions d'un même client (et pas
+    seulement les consécutives) : ainsi une opération intercalée dans le même
+    pays ne masque pas un aller-retour géographique impossible.
+    """
     flagged = set()
     for user_txs in _group_by_user(transactions).values():
         located = [
@@ -123,13 +128,13 @@ def _geo_flagged_ids(transactions):
             if t.get("country")
         ]
         located = [(t, dt) for (t, dt) in located if dt is not None]
-        located.sort(key=lambda pair: pair[1])
-        for (ta, da), (tb, db) in zip(located, located[1:]):
-            if ta.get("country") != tb.get("country"):
-                gap_hours = abs((db - da).total_seconds()) / 3600.0
-                if gap_hours < IMPOSSIBLE_TRAVEL_HOURS:
-                    flagged.add(id(ta))
-                    flagged.add(id(tb))
+        for i, (ta, da) in enumerate(located):
+            for (tb, db) in located[i + 1:]:
+                if ta.get("country") != tb.get("country"):
+                    gap_hours = abs((db - da).total_seconds()) / 3600.0
+                    if gap_hours < IMPOSSIBLE_TRAVEL_HOURS:
+                        flagged.add(id(ta))
+                        flagged.add(id(tb))
     return flagged
 
 
