@@ -11,6 +11,7 @@ Règles :
 
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from fraud_detection import detect_fraud, load_transactions
@@ -33,15 +34,127 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
 
     Le jury évalue : clarté, utilité, intuitivité — pas le code en lui-même.
     """
-    st.warning(
-        "Interface à compléter : remplacez ce message par votre propre écran "
-        "dans la fonction `render_interface()`."
-    )
+    by_id = {t.get("transaction_id"): t for t in transactions}
+    rows = []
+    for r in results:
+        tx = by_id.get(r["transaction_id"], {})
+        rows.append({
+            "Transaction": r["transaction_id"],
+            "Client": tx.get("user_id"),
+            "Date": tx.get("timestamp"),
+            "Montant": tx.get("amount"),
+            "Devise": tx.get("currency"),
+            "Commerçant": tx.get("merchant"),
+            "Pays": tx.get("country"),
+            "Carte présente": tx.get("card_present"),
+            "Risque": round(float(r.get("fraud_score", 0.0)) * 100),
+            "Suspecte": bool(r.get("is_suspicious")),
+            "Explication": r.get("reason", ""),
+        })
+    df = pd.DataFrame(rows)
 
-    # Fallback minimal — à remplacer par votre design
-    st.subheader("Aperçu brut (temporaire)")
-    st.caption(f"{len(transactions)} transactions · {sum(1 for r in results if r.get('is_suspicious'))} alerte(s)")
-    st.dataframe(results, use_container_width=True)
+    total = len(df)
+    alerts = int(df["Suspecte"].sum()) if total else 0
+    clean = total - alerts
+    clients_risque = (
+        df.loc[df["Suspecte"], "Client"].nunique() if total else 0
+    )
+    taux = (alerts / total * 100) if total else 0.0
+
+    # --- Indicateurs clés (langage simple) ---
+    st.subheader("Vue d'ensemble")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Transactions analysées", total)
+    c2.metric("Alertes (suspectes)", alerts, delta=f"{taux:.0f}% du volume",
+              delta_color="inverse")
+    c3.metric("Transactions saines", clean)
+    c4.metric("Clients à surveiller", clients_risque)
+
+    if alerts:
+        st.error(f"⚠️ {alerts} transaction(s) suspecte(s) à vérifier en priorité.")
+    else:
+        st.success("✅ Aucune transaction suspecte détectée sur ce lot.")
+
+    st.divider()
+
+    # --- Pourquoi ces alertes ? (répartition par motif) ---
+    if alerts:
+        st.subheader("Pourquoi ces alertes ?")
+        motifs = (
+            df.loc[df["Suspecte"], "Explication"]
+            .value_counts()
+            .rename_axis("Motif")
+            .reset_index(name="Nombre")
+        )
+        cg, ct = st.columns([1, 1])
+        with cg:
+            st.bar_chart(motifs.set_index("Motif"))
+        with ct:
+            st.dataframe(motifs, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # --- Tableau filtrable ---
+    st.subheader("Détail des transactions")
+    f1, f2 = st.columns([1, 2])
+    with f1:
+        vue = st.radio(
+            "Afficher",
+            ["Seulement les suspectes", "Tout"],
+            index=0 if alerts else 1,
+            horizontal=False,
+        )
+    with f2:
+        clients = ["(tous)"] + sorted(
+            str(c) for c in df["Client"].dropna().unique()
+        )
+        client_sel = st.selectbox("Filtrer par client", clients)
+
+    view = df.copy()
+    if vue == "Seulement les suspectes":
+        view = view[view["Suspecte"]]
+    if client_sel != "(tous)":
+        view = view[view["Client"].astype(str) == client_sel]
+
+    def _style(row):
+        color = "background-color: rgba(255,75,75,0.18)" if row["Suspecte"] else ""
+        return [color] * len(row)
+
+    if view.empty:
+        st.info("Aucune transaction ne correspond à ce filtre.")
+    else:
+        st.dataframe(
+            view.style.apply(_style, axis=1).format({"Montant": "{:.2f}"}),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Risque": st.column_config.ProgressColumn(
+                    "Niveau de risque",
+                    min_value=0, max_value=100, format="%d%%",
+                ),
+            },
+        )
+
+    # --- Zone pédagogique : comment l'outil décide ---
+    with st.expander("Comment l'outil décide-t-il ?"):
+        st.markdown(
+            """
+Chaque transaction est comparée à **l'historique du client** et passée au crible
+de plusieurs règles, de la plus simple à la plus fine :
+
+- **Champ obligatoire manquant** (pays, montant, commerçant…) → donnée douteuse.
+- **Montant nul ou négatif** → opération anormale.
+- **Montant très supérieur à l'habitude du client** (plusieurs fois sa dépense
+  habituelle) → achat inhabituel à vérifier.
+- **Deux pays différents en trop peu de temps** → déplacement physiquement
+  impossible (carte clonée probable).
+- **Rafale de transactions** en quelques minutes → test de carte volée.
+
+Pour **éviter de gêner les clients honnêtes**, une transaction simplement un peu
+plus chère que d'ordinaire, ou un voyage avec assez de temps entre deux pays,
+**n'est pas** signalée.
+            """
+        )
 
 
 def main() -> None:

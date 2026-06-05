@@ -6,6 +6,7 @@ La fonction `load_transactions` vous est FOURNIE (ne la modifiez pas).
 """
 
 import csv
+from datetime import datetime, timezone
 
 
 def load_transactions(path):
@@ -47,10 +48,195 @@ def _clean_row(row):
     }
 
 
+# --- Paramètres de la logique métier (réglés pour limiter les faux positifs) ---
+
+# Champs considérés comme indispensables pour traiter une transaction.
+# (timestamp et card_present sont tolérés vides par l'énoncé.)
+REQUIRED_FIELDS = ("amount", "currency", "merchant", "country", "user_id")
+
+# Un montant est "très supérieur à l'habitude" s'il dépasse à la fois
+# un multiple du montant habituel ET une marge absolue (évite de signaler
+# un simple achat un peu plus cher que d'ordinaire).
+HIGH_AMOUNT_FACTOR = 5.0
+HIGH_AMOUNT_ABS_MARGIN = 100.0
+MIN_HISTORY_FOR_AMOUNT = 2
+
+# Deux pays différents séparés par moins de ce délai = déplacement impossible.
+IMPOSSIBLE_TRAVEL_HOURS = 6
+
+# Rafale de transactions : trop d'opérations dans une fenêtre très courte.
+BURST_WINDOW_MINUTES = 10
+BURST_MIN_COUNT = 4
+
+# Seuils de score par règle (alignés sur la référence du défi).
+SCORE_NEGATIVE = 0.9
+SCORE_HIGH_AMOUNT = 0.9
+SCORE_GEO = 0.88
+SCORE_MISSING = 0.85
+SCORE_BURST = 0.8
+
+
+def _parse_timestamp(ts):
+    """Convertit un horodatage ISO 8601 en datetime aware (UTC), ou None."""
+    if not ts:
+        return None
+    s = str(ts).strip()
+    if not s:
+        return None
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    dt = None
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except ValueError:
+                dt = None
+        if dt is None:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _group_by_user(transactions):
+    groups = {}
+    for tx in transactions:
+        groups.setdefault(tx.get("user_id"), []).append(tx)
+    return groups
+
+
+def _geo_flagged_ids(transactions):
+    """Identifiants impliqués dans un changement de pays trop rapide pour être réel."""
+    flagged = set()
+    for user_txs in _group_by_user(transactions).values():
+        located = [
+            (t, _parse_timestamp(t.get("timestamp")))
+            for t in user_txs
+            if t.get("country")
+        ]
+        located = [(t, dt) for (t, dt) in located if dt is not None]
+        located.sort(key=lambda pair: pair[1])
+        for (ta, da), (tb, db) in zip(located, located[1:]):
+            if ta.get("country") != tb.get("country"):
+                gap_hours = abs((db - da).total_seconds()) / 3600.0
+                if gap_hours < IMPOSSIBLE_TRAVEL_HOURS:
+                    flagged.add(id(ta))
+                    flagged.add(id(tb))
+    return flagged
+
+
+def _burst_flagged_ids(transactions):
+    """Identifiants pris dans une rafale anormale d'opérations (ex. test de carte)."""
+    flagged = set()
+    for user_txs in _group_by_user(transactions).values():
+        located = [
+            (t, _parse_timestamp(t.get("timestamp")))
+            for t in user_txs
+        ]
+        located = [(t, dt) for (t, dt) in located if dt is not None]
+        located.sort(key=lambda pair: pair[1])
+        window = BURST_WINDOW_MINUTES * 60.0
+        for i, (ti, di) in enumerate(located):
+            count = sum(
+                1 for (_, dj) in located
+                if abs((dj - di).total_seconds()) <= window
+            )
+            if count >= BURST_MIN_COUNT:
+                flagged.add(id(ti))
+    return flagged
+
+
+def _user_amount_stats(transactions):
+    """Pour chaque utilisateur, la somme et le nombre de montants valides (> 0)."""
+    stats = {}
+    for tx in transactions:
+        amount = tx.get("amount")
+        if isinstance(amount, (int, float)) and amount > 0:
+            total, n = stats.get(tx.get("user_id"), (0.0, 0))
+            stats[tx.get("user_id")] = (total + amount, n + 1)
+    return stats
+
+
 def detect_fraud(transactions):
     """Analyse une liste de transactions et renvoie un verdict pour chacune.
 
     Retour : list[dict] avec transaction_id, fraud_score (0-1),
     is_suspicious (bool), reason (str) — un résultat par transaction, même ordre.
+
+    Stratégie (du plus simple au plus fin) :
+      Niveau 1 — anomalies évidentes : champs manquants, montant nul/négatif.
+      Niveau 2 — logique métier : montant anormal vs historique du client,
+                 incohérence géographique, fréquence (rafale) suspecte.
+      Niveau 3 — finesse : marges et historique minimal pour éviter de
+                 signaler à tort des transactions inhabituelles mais légitimes.
     """
-    raise NotImplementedError("Implémentez detect_fraud")
+    if not transactions:
+        return []
+
+    geo_flagged = _geo_flagged_ids(transactions)
+    burst_flagged = _burst_flagged_ids(transactions)
+    amount_stats = _user_amount_stats(transactions)
+
+    results = []
+    for tx in transactions:
+        reasons = []  # liste de (score, raison)
+
+        amount = tx.get("amount")
+
+        # --- Niveau 1 : champs obligatoires manquants ---
+        missing = [f for f in REQUIRED_FIELDS if tx.get(f) in (None, "")]
+        if missing:
+            reasons.append(
+                (SCORE_MISSING, "Champs obligatoires manquants: " + ", ".join(missing))
+            )
+
+        # --- Niveau 1 : montant nul ou négatif ---
+        if isinstance(amount, (int, float)) and amount <= 0:
+            reasons.append((SCORE_NEGATIVE, "Montant nul ou négatif"))
+
+        # --- Niveau 2 : montant très supérieur à l'habitude du client ---
+        if isinstance(amount, (int, float)) and amount > 0:
+            total, n = amount_stats.get(tx.get("user_id"), (0.0, 0))
+            others_total = total - amount
+            others_n = n - 1
+            if others_n >= MIN_HISTORY_FOR_AMOUNT:
+                typical = others_total / others_n
+                if typical > 0 and (
+                    amount > HIGH_AMOUNT_FACTOR * typical
+                    and amount - typical > HIGH_AMOUNT_ABS_MARGIN
+                ):
+                    reasons.append(
+                        (SCORE_HIGH_AMOUNT,
+                         "Montant très supérieur à l'habitude du client")
+                    )
+
+        # --- Niveau 2 : incohérence géographique ---
+        if id(tx) in geo_flagged:
+            reasons.append(
+                (SCORE_GEO, "Deux pays différents en trop peu de temps")
+            )
+
+        # --- Niveau 2 : fréquence / rafale anormale ---
+        if id(tx) in burst_flagged:
+            reasons.append((SCORE_BURST, "Fréquence de transactions anormale"))
+
+        # --- Verdict : on retient la raison la plus grave ---
+        if reasons:
+            score, reason = max(reasons, key=lambda r: r[0])
+            is_suspicious = True
+        else:
+            score, reason = 0.0, "Transaction conforme au profil du client"
+            is_suspicious = False
+
+        results.append({
+            "transaction_id": tx.get("transaction_id"),
+            "fraud_score": round(float(score), 2),
+            "is_suspicious": is_suspicious,
+            "reason": reason,
+        })
+
+    return results
